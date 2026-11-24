@@ -100,8 +100,10 @@ isLower = function(c)
 	return c != c.upper
 end function
 
-// Map a PostScript font name (e.g. "Arial-BoldItalicMT") to SVG font attributes.
-fontAttrs = function(psName)
+// Guess font info {family, weight, italic} from a PostScript font name like
+// "Arial-BoldItalicMT".  Used only when the textlayout helper isn't available
+// (it reports the real values).
+guessFontInfo = function(psName)
 	psName = str(psName)
 	dash = psName.indexOf("-")
 	if dash == null then
@@ -121,45 +123,85 @@ fontAttrs = function(psName)
 		if i > 0 and isLower(fam[i-1]) and isUpper(fam[i]) then spaced += " "
 		spaced += fam[i]
 	end for
-	weight = "normal"
-	if style.contains("Semibold") or style.contains("Medium") then
-		weight = "600"
-	else if style.contains("Bold") or style.contains("Black") or style.contains("Heavy") then
-		weight = "bold"
-	end if
-	italic = "normal"
-	if style.contains("Italic") or style.contains("Oblique") then italic = "italic"
-	return attr("font-family", spaced + ", " + psName + ", sans-serif") +
-	  attr("font-weight", weight) + attr("font-style", italic)
+	weight = 400
+	for kv in {"Thin":100, "Light":300, "Medium":500, "Semibold":600, "Bold":700, "Heavy":900, "Black":900}
+		if style.contains(kv.key) then weight = kv.value
+	end for
+	italic = style.contains("Italic") or style.contains("Oblique")
+	return {"family": spaced, "weight": weight, "italic": italic}
 end function
 
-// Very rough text-width estimate, used for wrapping (SVG has no auto-wrap).
+// SVG font attributes for a PostScript font name, given its font info.
+fontAttrs = function(psName, info)
+	style = "normal"
+	if info.italic then style = "italic"
+	return attr("font-family", info.family + ", " + psName + ", sans-serif") +
+	  attr("font-weight", info.weight) + attr("font-style", style)
+end function
+
+// The styled runs of a TextShape, as a list of {text, font, size, color}.
+textSpans = function(s)
+	result = []
+	spans = get(s, "TextSpans")
+	if not spans then spans = [{"Text": get(s, "Text", "")}]
+	for sp in spans
+		result.push {"text": str(get(sp, "Text", "")),
+		  "font": get(sp, "FontName", get(s, "FontName", "Helvetica")),
+		  "size": get(sp, "FontSize", get(s, "FontSize", 12)),
+		  "color": get(sp, "TextColor", "rgba(0,0,0,1)")}
+	end for
+	return result
+end function
+
+// Very rough text-width estimate (used only without the textlayout helper).
 textWidth = function(s, size, bold)
 	if bold then return s.len * size * 0.56
 	return s.len * size * 0.5
 end function
 
-// Wrap text into lines that fit the given width.
-wrap = function(text, width, size, bold)
-	lines = []
-	for para in text.split(char(10))
-		// split into words, each keeping its trailing space
-		words = para.split(" ")
-		for i in range(0, words.len - 2, 1)
-			words[i] += " "
+// Estimate the layout of a text box, in the same form textlayout returns:
+// {lines: [{x, baseline, runs: [{span, text}]}]}, relative to the box's top left.
+// (Used only when the textlayout helper isn't available.)
+estimateLayout = function(spans, width, align)
+	lines = [{"runs": [], "width": 0, "adv": 0, "size": 0}]
+	for si in spans.indexes
+		sp = spans[si]
+		bold = guessFontInfo(sp.font).weight >= 600
+		paras = sp.text.split(char(10))
+		for pi in paras.indexes
+			if pi > 0 then lines.push {"runs": [], "width": 0, "adv": 0, "size": 0}
+			words = paras[pi].split(" ")
+			for wi in words.indexes
+				word = words[wi]
+				if wi < words.len - 1 then word += " "
+				ln = lines[-1]
+				trimmedW = textWidth(word.trimRight, sp.size, bold)
+				if ln.runs and ln.adv + trimmedW > width then
+					ln = {"runs": [], "width": 0, "adv": 0, "size": 0}
+					lines.push ln
+				end if
+				if ln.runs and ln.runs[-1].span == si then
+					ln.runs[-1].text += word
+				else
+					ln.runs.push {"span": si, "text": word}
+				end if
+				if word.trimRight != "" then ln.width = ln.adv + trimmedW
+				ln.adv += textWidth(word, sp.size, bold)
+				if sp.size > ln.size then ln.size = sp.size
+			end for
 		end for
-		cur = ""
-		for w in words
-			if cur != "" and textWidth(cur + w.trimRight, size, bold) > width then
-				lines.push cur
-				cur = w
-			else
-				cur += w
-			end if
-		end for
-		lines.push cur
 	end for
-	return lines
+	y = 0
+	for i in lines.indexes
+		ln = lines[i]
+		if ln.size == 0 then ln.size = spans[-1].size
+		if i == 0 then y += ln.size * 0.95 else y += ln.size * 1.15
+		ln.baseline = y
+		ln.x = 0
+		if align == 1 then ln.x = width - ln.width
+		if align == 2 then ln.x = (width - ln.width) / 2
+	end for
+	return {"lines": lines}
 end function
 
 // ----------------------------------------------------------------------
@@ -170,11 +212,13 @@ Converter.defs = null		// list of SVG <defs> entries
 Converter.nextId = 0
 Converter.images = null		// image name -> data URL
 Converter.warnings = null	// map of warning text -> count
+Converter.fonts = null		// PostScript name -> font info, from textlayout
 
 Converter.init = function(workDir)
 	self.defs = []
 	self.warnings = {}
 	self.images = {}
+	self.fonts = {}
 	imgDir = file.child(workDir, "Images")
 	if not file.exists(imgDir) then return self
 	for name in file.children(imgDir)
@@ -200,49 +244,89 @@ Converter.warn = function(msg)
 	self.warnings[msg] = get(self.warnings, msg, 0) + 1
 end function
 
-// Text content of a TextShape at offset (x, y).
+// Font info {family, weight, italic} for a PostScript font name.
+Converter.fontInfo = function(psName)
+	info = get(self.fonts, psName)
+	if info == null then
+		info = guessFontInfo(psName)
+	else if not info.found then
+		self.warn "font " + psName + " is not installed"
+		info = guessFontInfo(psName)
+	end if
+	return info
+end function
+
+// Find every TextShape in a list of shapes (recursing into groups).
+findTextShapes = function(shapes, results)
+	for s in shapes
+		kind = get(s, "ShapeType")
+		if kind == "TextShape" then results.push s
+		if kind == "ShapeGroup" then findTextShapes get(s, "Shapes", []), results
+	end for
+	return results
+end function
+
+// Lay out all the text in the document using the textlayout helper (CoreText),
+// storing each result as s._layout on its TextShape.
+Converter.layoutText = function(doc, tmpDir)
+	shapes = []
+	for layer in get(doc, "Layers", [])
+		findTextShapes get(layer, "Shapes", []), shapes
+	end for
+	if not shapes then return
+	helper = file.child(file.parent(file.info(shellArgs[0]).path), "textlayout")
+	if not file.exists(helper) then
+		self.warn "textlayout helper not built (see README); text positions are estimates"
+		return
+	end if
+	boxes = []
+	for s in shapes
+		box = bbox(s.Path)
+		boxes.push {"width": box[2] - box[0], "align": get(s, "TextAlignment", 0), "spans": textSpans(s)}
+	end for
+	inPath = file.child(tmpDir, "text.json")
+	file.writeLines inPath, [json.toJSON({"boxes": boxes}, true)]
+	r = run(shq(helper) + " " + shq(inPath))
+	if r isa error then
+		self.warn "textlayout failed; text positions are estimates"
+		return
+	end if
+	result = json.parse(r)
+	for i in shapes.indexes
+		shapes[i]._layout = result.boxes[i]
+	end for
+	self.fonts = result.fonts
+end function
+
+// Text content of a TextShape at offset (x, y).  Each line becomes its own
+// left-aligned <text> element, since importers (e.g. Amadine) ignore
+// text-anchor; the line positions come from the layout.
 Converter.textShape = function(s, x, y)
 	box = bbox(s.Path)
-	w = box[2] - box[0]
-	spans = get(s, "TextSpans")
-	if not spans then
-		spans = [{"Text": get(s, "Text", ""), "FontName": get(s, "FontName"),
-		  "FontSize": get(s, "FontSize", 12)}]
-	end if
-	align = get(s, "TextAlignment", 0)  // NSTextAlignment: 0 left, 1 right, 2 center
-	if align == 1 then
-		anchor = "end"; ax = x + box[2]
-	else if align == 2 then
-		anchor = "middle"; ax = x + (box[0] + box[2]) / 2
-	else
-		anchor = "start"; ax = x + box[0]
-		if align > 2 then self.warn "justified text rendered left-aligned"
-	end if
+	spans = textSpans(s)
+	align = get(s, "TextAlignment", 0)  // NSTextAlignment: 0 left, 1 right, 2 center, 3 justified
+	if align == 3 then self.warn "justified text rendered left-aligned"
+	layout = get(s, "_layout")
+	if layout == null then layout = estimateLayout(spans, box[2] - box[0], align)
 	out = []
-	cy = y + box[1]
-	lineOpen = false
-	for sp in spans
-		size = get(sp, "FontSize", 12)
-		fontName = get(sp, "FontName", get(s, "FontName", "Helvetica"))
-		bold = fontName.contains("Bold")
-		c = color(get(sp, "TextColor"))
-		text = str(get(sp, "Text", ""))
-		lines = wrap(text, w, size, bold)
-		for i in lines.indexes
-			if i > 0 or not lineOpen then
-				if out then cy += size * 1.15 else cy += size * 0.95
-				t = "<tspan" + attr("x", fmt(ax)) + attr("y", fmt(cy))
-				lineOpen = true
-			else
-				t = "<tspan"
-			end if
-			t += fontAttrs(fontName) + attr("font-size", fmt(size)) + attr("fill", c[0])
+	for ln in layout.lines
+		if not ln.runs then continue
+		t = "<text" + attr("x", fmt(x + box[0] + ln.x)) + attr("y", fmt(y + box[1] + ln.baseline)) +
+		  " xml:space=""preserve"">"
+		for ri in ln.runs.indexes
+			run = ln.runs[ri]
+			text = run.text
+			if ri == ln.runs.len - 1 then text = text.trimRight(" ")
+			sp = spans[run.span]
+			c = color(sp.color)
+			t += "<tspan" + fontAttrs(sp.font, self.fontInfo(sp.font)) + attr("font-size", fmt(sp.size)) +
+			  attr("fill", c[0])
 			if c[1] < 1 then t += attr("fill-opacity", fmt(c[1]))
-			out.push t + ">" + esc(lines[i]) + "</tspan>"
+			t += ">" + esc(text) + "</tspan>"
 		end for
-		lineOpen = not text.endsWith(char(10))
+		out.push t + "</text>"
 	end for
-	return "<text" + attr("text-anchor", anchor) + " xml:space=""preserve"">" + out.join("") + "</text>"
+	return out.join(char(10))
 end function
 
 // Fill/stroke/shadow appearance of a shape at offset (x, y).
@@ -413,6 +497,7 @@ convertIn = function(srcPath, dstPath, tmp)
 	if doc isa error then return doc
 
 	conv = (new Converter).init(work)
+	conv.layoutText doc, tmp
 	lines = conv.document(doc)
 	r = file.writeLines(dstPath, lines)
 	if r isa error then return r

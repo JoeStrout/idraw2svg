@@ -11,9 +11,18 @@ Each `foo.idraw` becomes `foo.svg` beside it (an existing `foo.svg` is
 overwritten).  Folders are searched recursively.  Unsupported features are
 reported as "note:" lines per file.
 
+## Building
+
+`./make-droplet.sh` builds two things:
+
+- `textlayout`, a small Swift helper that lays out each text box with CoreText
+  (the real fonts), giving the line breaks, widths, and baselines.  Without it
+  the converter still works, but text layout is estimated from character counts.
+- `idraw2svg.app`, the droplet.
+
 ## Droplet
 
-`./make-droplet.sh` builds `idraw2svg.app`.  Drop files or folders on it (or
+  Drop files or folders on it (or
 double-click it to pick files).  It expects MiniScript 2 at
 `/usr/local/bin/miniscript` and this repo at `~/svnrepo/idraw2svg`; edit the
 properties at the top of `droplet.applescript` if those move.
@@ -44,8 +53,12 @@ A zip containing `data.xml` (actually a binary plist), `Images/`, and
 
 ## Known limitations
 
-- SVG has no text wrapping, so text boxes are pre-wrapped using estimated
-  character widths; line breaks may differ from the original, and text
-  imports as fixed lines rather than reflowable boxes.
+- SVG has no text wrapping, so text boxes are pre-wrapped (by `textlayout`),
+  and each line becomes its own left-aligned `<text>` element at a computed x.
+  (Amadine ignores `text-anchor` entirely, and splits multi-line text into
+  separate objects per line anyway.)  So text imports as fixed lines rather
+  than reflowable boxes.
+- Fonts that aren't installed get a note, and fall back to guesses from the
+  PostScript name.
 - Fill transforms, non-linear gradients, and image scaling modes other than
   stretch are not yet handled (they produce a note).
